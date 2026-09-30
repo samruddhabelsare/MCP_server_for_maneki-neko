@@ -12,6 +12,9 @@ from __future__ import annotations
 import logging
 import sys
 
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,6 +40,19 @@ logging.basicConfig(
 )
 logger = logging.getLogger("maneki.main")
 
+# ── MCP Sub-apps ─────────────────────────────────────────────────────────────
+# Create streamable HTTP sub-apps before mounting and lifespan
+customer_mcp_app = mcp_customer.streamable_http_app()
+admin_mcp_app = mcp_admin.streamable_http_app()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Manage lifecycle for FastMCP session managers."""
+    async with mcp_customer.session_manager.run(), mcp_admin.session_manager.run():
+        yield
+
+
 # ── FastAPI app ───────────────────────────────────────────────────────────────
 app = FastAPI(
     title="Maneki Neko MCP Server",
@@ -44,6 +60,7 @@ app = FastAPI(
     version="0.1.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
@@ -75,7 +92,7 @@ app.include_router(rest_router)
 
 # ── MCP sub-apps ─────────────────────────────────────────────────────────────
 # Streamable HTTP transport — Inspector connects to these endpoints.
-app.mount("/mcp/customer", mcp_customer.streamable_http_app())
-app.mount("/mcp/admin",    mcp_admin.streamable_http_app())
+app.mount("/mcp/customer", customer_mcp_app)
+app.mount("/mcp/admin",    admin_mcp_app)
 
 logger.info('"Maneki Neko MCP Server started on port %s"', _cfg.port)
