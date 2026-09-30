@@ -28,7 +28,7 @@ from maneki.models import (
     OrderItem,
 )
 from maneki.services.drafts import get_or_create_draft
-from maneki.services.menu import get_menu_item
+from maneki.services.menu import get_menu_item, load_menu
 from maneki.services.sessions import get_session
 
 
@@ -221,6 +221,63 @@ def get_latest_active_order(
             return order
 
     return None
+
+
+def list_active_orders(restaurant_id: UUID | str) -> list[dict[str, Any]]:
+    """Retrieve all active orders (pending, preparing, ready) for a restaurant.
+
+    Resolves `is_veg` flag for each item from the restaurant menu.
+    Orders are returned in chronological order (earliest first for KDS).
+    """
+    cfg = get_settings()
+    db = get_db()
+
+    # Build menu is_veg lookup map
+    menu_items = load_menu(restaurant_id, include_unavailable=True)
+    veg_map = {m.name.lower().strip(): m.is_veg for m in menu_items}
+
+    res = (
+        db.table(cfg.orders_table)
+        .select("*")
+        .eq("restaurant_id", str(restaurant_id))
+        .order("created_at", desc=False)
+        .execute()
+    )
+    all_orders = cast(list[dict[str, Any]], res.data) if res.data else []
+
+    active_statuses = {"pending", "preparing", "ready"}
+    active = [o for o in all_orders if str(o.get("status", "")).lower() in active_statuses]
+
+    formatted: list[dict[str, Any]] = []
+    for o in active:
+        raw_items = o.get("items") or []
+        items_list: list[dict[str, Any]] = []
+        if isinstance(raw_items, list):
+            for it in raw_items:
+                if isinstance(it, dict):
+                    name = str(it.get("name", ""))
+                    is_veg = it.get("is_veg")
+                    if is_veg is None:
+                        is_veg = veg_map.get(name.lower().strip(), False)
+                    items_list.append(
+                        {
+                            "name": name,
+                            "qty": int(it.get("qty", 1)),
+                            "is_veg": bool(is_veg),
+                            "instructions": str(it.get("instructions") or ""),
+                        }
+                    )
+        formatted.append(
+            {
+                "id": str(o.get("id")),
+                "table_number": int(o.get("table_number", 1)),
+                "status": str(o.get("status", "pending")),
+                "items": items_list,
+                "created_at": str(o.get("created_at") or ""),
+            }
+        )
+
+    return formatted
 
 
 def _parse_order(raw: dict[str, Any]) -> Order:

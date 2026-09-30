@@ -11,14 +11,14 @@ from __future__ import annotations
 
 import logging
 import sys
-
+from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from maneki.admin_api import router as admin_router
 from maneki.api import router as rest_router
 from maneki.config import get_settings
 from maneki.errors import ManekiError
@@ -89,6 +89,7 @@ async def unhandled_error_handler(request: Request, exc: Exception) -> JSONRespo
 
 # ── REST routes ───────────────────────────────────────────────────────────────
 app.include_router(rest_router)
+app.include_router(admin_router)
 
 # ── MCP sub-apps ─────────────────────────────────────────────────────────────
 # Streamable HTTP transport — Inspector connects to these endpoints.

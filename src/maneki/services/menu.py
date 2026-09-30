@@ -11,7 +11,7 @@ from uuid import UUID
 
 from maneki.config import get_settings
 from maneki.db import get_db
-from maneki.errors import AmbiguousItemError, ItemNotFoundError
+from maneki.errors import AmbiguousItemError, ItemNotFoundError, ValidationError
 from maneki.models import MenuItem
 
 
@@ -139,6 +139,46 @@ def update_item_price(
     rows = cast(list[dict[str, Any]], res.data) if res.data else []
     raw = rows[0] if rows else {**item.model_dump(), "price": price}
     return _parse_menu_item(raw)
+
+
+def set_item_availability_by_id(
+    item_id: UUID | str,
+    is_available: bool,
+) -> MenuItem:
+    """Set availability for a menu item directly by its UUID."""
+    cfg = get_settings()
+    db = get_db()
+    res = (
+        db.table(cfg.menu_table)
+        .update({"is_available": is_available})
+        .eq("id", str(item_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], res.data) if res.data else []
+    if not rows:
+        raise ItemNotFoundError(str(item_id))
+    return _parse_menu_item(rows[0])
+
+
+def update_item_price_by_id(
+    item_id: UUID | str,
+    price: float,
+) -> MenuItem:
+    """Update price for a menu item directly by its UUID."""
+    if price <= 0:
+        raise ValidationError("Price must be greater than 0.")
+    cfg = get_settings()
+    db = get_db()
+    res = (
+        db.table(cfg.menu_table)
+        .update({"price": price})
+        .eq("id", str(item_id))
+        .execute()
+    )
+    rows = cast(list[dict[str, Any]], res.data) if res.data else []
+    if not rows:
+        raise ItemNotFoundError(str(item_id))
+    return _parse_menu_item(rows[0])
 
 
 def _parse_menu_item(raw: dict[str, Any]) -> MenuItem:

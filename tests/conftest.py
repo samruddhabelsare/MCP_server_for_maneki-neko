@@ -77,6 +77,10 @@ class FakeQueryBuilder:
         self._filters.append((col, val))
         return self
 
+    def in_(self, col: str, vals: list[Any]) -> FakeQueryBuilder:
+        self._filters.append((col, ("in", vals)))
+        return self
+
     def limit(self, n: int) -> FakeQueryBuilder:
         self._limit = n
         return self
@@ -90,7 +94,9 @@ class FakeQueryBuilder:
         for col, cond in self._filters:
             if isinstance(cond, tuple) and len(cond) == 2:
                 op, val = cond
-                if op == "gte":
+                if op == "in":
+                    rows = [r for r in rows if r.get(col) in val or str(r.get(col)) in [str(v) for v in val]]
+                elif op == "gte":
                     rows = [r for r in rows if r.get(col) is not None and r.get(col) >= val]
                 elif op == "lte":
                     rows = [r for r in rows if r.get(col) is not None and r.get(col) <= val]
