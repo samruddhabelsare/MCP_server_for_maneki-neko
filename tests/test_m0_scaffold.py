@@ -8,7 +8,7 @@ from pydantic import ValidationError
 
 def test_settings_fail_fast(monkeypatch: pytest.MonkeyPatch) -> None:
     """App config must raise if required env vars are absent."""
-    from maneki.config import get_settings
+    from maneki.config import Settings, get_settings
 
     get_settings.cache_clear()
     monkeypatch.delenv("SUPABASE_URL", raising=False)
@@ -17,7 +17,7 @@ def test_settings_fail_fast(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("INTERNAL_MCP_TOKEN", raising=False)
 
     with pytest.raises(ValidationError):
-        get_settings()
+        Settings(_env_file=None)
 
     get_settings.cache_clear()
 
