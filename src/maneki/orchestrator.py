@@ -523,7 +523,7 @@ async def stream_orchestrator_chat(
     iteration = 0
     final_text_accumulated = ""
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0)) as client:
         while iteration < MAX_TOOL_ITERATIONS:
             iteration += 1
 
@@ -540,18 +540,37 @@ async def stream_orchestrator_chat(
                 "Content-Type": "application/json",
             }
 
-            try:
-                resp = await client.post(cfg.nvidia_endpoint, json=payload, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-            except Exception as exc:
-                logger.error("NVIDIA API call failed in iteration %d: %s", iteration, exc)
-                yield _format_sse("error", {
-                    "ok": False,
-                    "error": "llm_error",
-                    "message": f"AI service error: {exc}",
-                })
+            resp_data: dict[str, Any] | None = None
+            for attempt in range(2):
+                try:
+                    resp = await client.post(cfg.nvidia_endpoint, json=payload, headers=headers)
+                    resp.raise_for_status()
+                    resp_data = resp.json()
+                    break
+                except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                    logger.warning("NVIDIA API attempt %d failed (transient): %r", attempt + 1, exc)
+                    if attempt == 1:
+                        logger.error("NVIDIA API call failed in iteration %d after retries: %r", iteration, exc, exc_info=True)
+                        yield _format_sse("error", {
+                            "ok": False,
+                            "error": "llm_error",
+                            "message": f"AI service timed out or connection failed: {exc}",
+                        })
+                        return
+                    await asyncio.sleep(1.0)
+                except Exception as exc:
+                    logger.error("NVIDIA API call failed in iteration %d: %r", iteration, exc, exc_info=True)
+                    yield _format_sse("error", {
+                        "ok": False,
+                        "error": "llm_error",
+                        "message": f"AI service error: {exc}",
+                    })
+                    return
+
+            if not resp_data:
                 return
+
+            data = resp_data
 
             choice = data["choices"][0]
             msg_obj = choice.get("message", {})
