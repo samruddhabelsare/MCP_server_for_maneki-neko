@@ -5,11 +5,18 @@ Uses an in-memory fake Supabase so no network calls are made in tests.
 from __future__ import annotations
 
 import copy
+import os
 from collections import defaultdict
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+
+# Ensure safe default environment variables exist during module collection
+os.environ.setdefault("SUPABASE_URL", "https://test.supabase.co")
+os.environ.setdefault("SUPABASE_SERVICE_KEY", "test-service-key")
+os.environ.setdefault("ADMIN_API_KEY", "test-admin-key")
+os.environ.setdefault("INTERNAL_MCP_TOKEN", "test-internal-token")
 
 from maneki.config import get_settings
 

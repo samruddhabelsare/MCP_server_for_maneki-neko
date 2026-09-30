@@ -15,12 +15,13 @@ from typing import Any
 from uuid import UUID
 
 from fastapi import APIRouter, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from maneki.db import get_db
 from maneki.errors import UnauthorizedError, ValidationError
 from maneki.models import ok
+from maneki.orchestrator import stream_orchestrator_chat
 from maneki.services.conversations import load_messages
 from maneki.services.customers import upsert_customer
 from maneki.services.drafts import (
@@ -66,6 +67,10 @@ class MarkBilledRequest(BaseModel):
 class SubmitFeedbackRequest(BaseModel):
     rating: int = Field(ge=1, le=5)
     comment: str | None = None
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=2000)
 
 
 # ── Health ────────────────────────────────────────────────────────────────────
@@ -242,6 +247,37 @@ async def get_session_messages_endpoint(
         limit=50,
     )
     return ok(messages=[m.model_dump() for m in messages])
+
+
+@router.post("/sessions/{id}/chat", tags=["chat"])
+async def session_chat_endpoint(
+    id: UUID,
+    payload: ChatRequest,
+    authorization: str | None = Header(default=None),
+) -> StreamingResponse:
+    """Stream chat interaction with the AI waiter via Server-Sent Events (SSE).
+
+    Runs the server-side tool-calling loop (NVIDIA NIM) bound to the session.
+    Emits token events, draft events on cart changes, and done event upon completion.
+    """
+    session = _verify_session_access(id, authorization)
+    generator = stream_orchestrator_chat(
+        session_id=session.id,
+        restaurant_id=session.restaurant_id,
+        table_number=session.table_number,
+        customer_id=session.customer_id,
+        character=session.character,
+        user_message=payload.message,
+    )
+    return StreamingResponse(
+        generator,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ── Orders ────────────────────────────────────────────────────────────────────
