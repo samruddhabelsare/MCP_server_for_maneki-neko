@@ -1,0 +1,46 @@
+# render.yaml — Render Blueprint
+# Deploy: connect your GitHub repo in Render dashboard and it picks this up automatically.
+# Docs: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: maneki-mcp
+    runtime: docker          # uses Dockerfile in repo root
+    dockerfilePath: ./Dockerfile
+    region: singapore        # closest to ap-south-1 / ap-southeast Supabase
+    plan: free               # upgrade to starter for always-on
+
+    # Render sets PORT automatically; uvicorn reads it in CMD
+    healthCheckPath: /healthz
+
+    # All secrets are set in Render Dashboard → Environment
+    # Never commit real values here.
+    envVars:
+      - key: SUPABASE_URL
+        sync: false          # set in dashboard
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: ADMIN_API_KEY
+        sync: false
+      - key: INTERNAL_MCP_TOKEN
+        sync: false
+      - key: NVIDIA_API_KEY
+        sync: false
+      - key: NVIDIA_MODEL
+        value: nvidia/nemotron-3.5-lightning-30b-a3b
+      - key: NVIDIA_ENDPOINT
+        value: https://integrate.api.nvidia.com/v1/chat/completions
+      - key: CORS_ORIGINS
+        sync: false          # set to your frontend URL in dashboard
+      - key: SESSION_TTL_HOURS
+        value: "6"
+      - key: LOG_LEVEL
+        value: INFO
+      - key: MENU_TABLE
+        value: menu_items
+      - key: ORDERS_TABLE
+        value: orders
+      - key: CUSTOMERS_TABLE
+        value: customers
+      - key: FEEDBACK_TABLE
+        value: feedback
