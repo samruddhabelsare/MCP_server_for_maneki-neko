@@ -14,6 +14,8 @@ Customer-scoped tools:
   - remove_item
   - set_quantity
   - clear_order
+  - get_order_status
+  - recommend_dishes
 """
 from __future__ import annotations
 
@@ -43,6 +45,8 @@ from maneki.services.drafts import (
 )
 from maneki.services.menu import get_menu_item as svc_get_menu_item
 from maneki.services.menu import search_menu as svc_search_menu
+from maneki.services.orders import get_latest_active_order
+from maneki.services.recommend import recommend_dishes as svc_recommend_dishes
 
 mcp_customer = FastMCP(
     name="maneki-customer",
@@ -225,6 +229,70 @@ async def clear_order(ctx: Context[Any, Any] | None = None) -> dict[str, Any]:
             restaurant_id=session.restaurant_id,
         )
         return ok(draft=format_draft(draft))
+    except ManekiError as exc:
+        return exc.to_dict()
+    except Exception as exc:
+        return err("internal_error", str(exc))
+
+
+@mcp_customer.tool()
+async def get_order_status(ctx: Context[Any, Any] | None = None) -> dict[str, Any]:
+    """Get the status of the latest active order for this session.
+
+    Returns the most recent non-billed, non-cancelled order for this table.
+    Useful for customers asking 'where is my order?' or 'is it ready yet?'
+    Returns null if no active order exists (i.e. nothing confirmed yet).
+    """
+    try:
+        session = require_session(ctx)
+        order = get_latest_active_order(session.session_id)
+        if order is None:
+            return ok(order=None, message="No active order found for this session.")
+        return ok(
+            order_id=str(order.id),
+            status=order.status,
+            table_number=order.table_number,
+            items=[it.model_dump() for it in order.items],
+            total_amount=order.total_amount,
+            created_at=order.created_at.isoformat() if order.created_at else None,
+        )
+    except ManekiError as exc:
+        return exc.to_dict()
+    except Exception as exc:
+        return err("internal_error", str(exc))
+
+
+@mcp_customer.tool()
+async def recommend_dishes(
+    veg_only: bool = False,
+    exclude_spicy: bool = False,
+    limit: int = 6,
+    ctx: Context[Any, Any] | None = None,
+) -> dict[str, Any]:
+    """Get personalized dish recommendations for this session.
+
+    Ranks candidates by: past order history, customer preferences, and
+    restaurant-wide popularity. Each result includes a `reasons` list
+    explaining why it was suggested — use these to phrase your suggestion
+    naturally. Do NOT invent additional reasons.
+
+    Args:
+        veg_only:      Only suggest vegetarian items.
+        exclude_spicy: Exclude spicy items.
+        limit:         Number of recommendations (1–20, default 6).
+    """
+    try:
+        session = require_session(ctx)
+        results = svc_recommend_dishes(
+            session=session,
+            veg_only=veg_only,
+            exclude_spicy=exclude_spicy,
+            limit=limit,
+        )
+        return ok(
+            recommendations=[r.model_dump() for r in results],
+            count=len(results),
+        )
     except ManekiError as exc:
         return exc.to_dict()
     except Exception as exc:

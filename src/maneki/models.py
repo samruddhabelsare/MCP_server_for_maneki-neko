@@ -133,6 +133,36 @@ class Feedback(BaseModel):
     created_at: datetime | None = None
 
 
+# ── Conversations ─────────────────────────────────────────────────────────────
+
+class Message(BaseModel):
+    id: UUID
+    conversation_id: UUID
+    role: str  # 'user' | 'assistant' | 'tool'
+    content: str
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    created_at: datetime | None = None
+
+
+class Conversation(BaseModel):
+    id: UUID
+    session_id: UUID
+    restaurant_id: UUID
+    created_at: datetime | None = None
+
+
+# ── Recommendations ───────────────────────────────────────────────────────────
+
+class RecommendedItem(BaseModel):
+    name: str
+    category: str
+    price: float
+    is_veg: bool
+    is_spicy: bool
+    reasons: list[str]  # Non-empty list of why this item is recommended
+
+
 # ── API response shapes ───────────────────────────────────────────────────────
 
 class OkResponse(BaseModel):

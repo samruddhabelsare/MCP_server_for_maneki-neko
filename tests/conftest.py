@@ -4,6 +4,7 @@ Uses an in-memory fake Supabase so no network calls are made in tests.
 """
 from __future__ import annotations
 
+import copy
 from collections import defaultdict
 from typing import Any
 from unittest.mock import MagicMock
@@ -73,25 +74,8 @@ class FakeQueryBuilder:
         self._limit = n
         return self
 
-    def order(self, *args: Any, **kwargs: Any) -> FakeQueryBuilder:
-        return self
-
-    def maybe_single(self) -> FakeQueryBuilder:
-        return self
-
-    def single(self) -> FakeQueryBuilder:
-        return self
-
-    def gte(self, col: str, val: Any) -> FakeQueryBuilder:
-        self._filters.append((col, ("gte", val)))
-        return self
-
-    def lte(self, col: str, val: Any) -> FakeQueryBuilder:
-        self._filters.append((col, ("lte", val)))
-        return self
-
-    def ilike(self, col: str, val: str) -> FakeQueryBuilder:
-        self._filters.append((col, ("ilike", val)))
+    def order(self, col: str, desc: bool = False, **kwargs: Any) -> FakeQueryBuilder:
+        self._store.sort(key=lambda r: str(r.get(col, "")), reverse=desc)
         return self
 
     def _matching_rows(self) -> list[dict[str, Any]]:
@@ -134,12 +118,59 @@ class FakeSupabase:
         return FakeQueryBuilder(self._tables[name])
 
     def rpc(self, name: str, params: dict[str, Any] | None = None) -> FakeQueryBuilder:
-        # Tests that need RPC behaviour should patch this individually
+        if name == "confirm_draft" and params:
+            sid = str(params["p_session_id"])
+            p_items = params.get("p_items", [])
+            p_total = params.get("p_total", 0.0)
+
+            # Find draft
+            drafts = [
+                d for d in self._tables["order_drafts"]
+                if str(d.get("session_id")) == sid and d.get("status") in ("open", "confirmed")
+            ]
+            if not drafts:
+                return FakeQueryBuilder([])
+            draft = drafts[0]
+
+            # Idempotency: return existing order if already confirmed
+            if draft.get("order_id"):
+                existing = [o for o in self._tables["orders"] if str(o.get("id")) == str(draft["order_id"])]
+                return FakeQueryBuilder(existing)
+
+            # Find session
+            sessions = [s for s in self._tables["sessions"] if str(s.get("id")) == sid]
+            session = sessions[0] if sessions else {}
+
+            from datetime import UTC, datetime
+            from uuid import uuid4
+            order_id = str(uuid4())
+            order_row = {
+                "id": order_id,
+                "restaurant_id": draft.get("restaurant_id"),
+                "customer_id": session.get("customer_id"),
+                "table_number": session.get("table_number", 1),
+                "items": p_items,
+                "total_amount": p_total,
+                "status": "pending",
+                "payment_method": "cash",
+                "customer_phone": None,
+                "bot_id": None,
+                "created_at": datetime.now(UTC).isoformat(),
+            }
+            self._tables["orders"].append(order_row)
+            draft["status"] = "confirmed"
+            draft["order_id"] = order_id
+            return FakeQueryBuilder([order_row])
+
         return FakeQueryBuilder([])
 
     def seed(self, table: str, rows: list[dict[str, Any]]) -> None:
-        """Helper: pre-populate a table."""
-        self._tables[table].extend(rows)
+        """Helper: pre-populate a table.
+
+        Deep-copies rows so that in-place updates during tests do not mutate
+        module-level fixture data (SAMPLE_MENU, etc.) shared across test functions.
+        """
+        self._tables[table].extend(copy.deepcopy(rows))
 
     def clear(self, table: str) -> None:
         self._tables[table].clear()
