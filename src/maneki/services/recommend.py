@@ -10,55 +10,36 @@ Ranking logic (higher score = better rank):
 
 Each candidate includes a non-empty `reasons` list explaining why it was
 suggested (e.g. "You ordered this before", "Popular this week").
+
+Phase 3: Popularity scores per restaurant are cached in popularity_cache.
 """
 from __future__ import annotations
 
 from collections import Counter
 from typing import Any, cast
+from uuid import UUID
 
+from maneki.cache import popularity_cache
 from maneki.config import get_settings
 from maneki.db import get_db
 from maneki.models import RecommendedItem, SessionContext
 from maneki.services.menu import load_menu
 
 
-def recommend_dishes(
-    session: SessionContext,
-    veg_only: bool = False,
-    exclude_spicy: bool = False,
-    limit: int = 6,
-) -> list[RecommendedItem]:
-    """Return ranked recommendations for the session's customer/table.
-
-    Args:
-        session:      Resolved session context (restaurant_id, customer_id).
-        veg_only:     If True, exclude non-vegetarian items.
-        exclude_spicy: If True, exclude spicy items.
-        limit:        Maximum number of results (1–20).
-
-    Returns:
-        Up to `limit` RecommendedItem objects, each with a non-empty `reasons`
-        list. Available items only.
-    """
-    limit = max(1, min(limit, 20))
+def _load_popularity(restaurant_id: UUID | str) -> Counter[str]:
+    """Load (cached) item popularity counter for a restaurant."""
+    rid = str(restaurant_id)
     cfg = get_settings()
+    cache_key = f"popularity:{rid}"
+    cached = popularity_cache.get(cache_key)
+    if cached is not None:
+        return cast(Counter[str], cached)
+
     db = get_db()
-
-    # ── 1. Load available menu items (apply dietary filters early) ────────────
-    available = load_menu(session.restaurant_id, include_unavailable=False)
-    candidates = [
-        item for item in available
-        if (not veg_only or item.is_veg)
-        and (not exclude_spicy or not item.is_spicy)
-    ]
-    if not candidates:
-        return []
-
-    # ── 2. Popularity: count item appearances in recent restaurant orders ─────
     recent_orders_res = (
         db.table(cfg.orders_table)
         .select("items")
-        .eq("restaurant_id", str(session.restaurant_id))
+        .eq("restaurant_id", rid)
         .limit(100)
         .execute()
     )
@@ -71,14 +52,71 @@ def recommend_dishes(
                 if isinstance(it, dict) and "name" in it:
                     popularity[str(it["name"]).lower()] += 1
 
-    # ── 3. Customer history: past items ordered by this customer ─────────────
+    popularity_cache.set(cache_key, popularity, ttl=cfg.popularity_cache_ttl)
+    return popularity
+
+
+def recommend_dishes(
+    session: SessionContext | None = None,
+    restaurant_id: UUID | str | None = None,
+    customer_id: UUID | str | None = None,
+    veg_only: bool = False,
+    exclude_spicy: bool = False,
+    limit: int = 6,
+) -> list[RecommendedItem]:
+    """Return ranked recommendations for the session's customer/table.
+
+    Args:
+        session:       Resolved session context (optional if restaurant_id passed).
+        restaurant_id: Restaurant UUID.
+        customer_id:   Customer UUID, or None for guests.
+        veg_only:      If True, exclude non-vegetarian items.
+        exclude_spicy: If True, exclude spicy items.
+        limit:         Maximum number of results (1–20).
+
+    Returns:
+        Up to `limit` RecommendedItem objects, each with a non-empty `reasons`
+        list. Available items only.
+    """
+    rid: UUID | str
+    cid: UUID | str | None
+    if isinstance(session, SessionContext):
+        rid = session.restaurant_id
+        cid = session.customer_id
+    elif session is not None:
+        rid = cast(UUID | str, session)
+        cid = customer_id
+    elif restaurant_id is not None:
+        rid = restaurant_id
+        cid = customer_id
+    else:
+        raise ValueError("Either session or restaurant_id must be provided")
+
+    limit = max(1, min(limit, 20))
+    cfg = get_settings()
+    db = get_db()
+
+    # ── 1. Load available menu items (apply dietary filters early) ─────────
+    available = load_menu(rid, include_unavailable=False)
+    candidates = [
+        item for item in available
+        if (not veg_only or item.is_veg)
+        and (not exclude_spicy or not item.is_spicy)
+    ]
+    if not candidates:
+        return []
+
+    # ── 2. Popularity (cached) ─────────────────────────────────────────────
+    popularity = _load_popularity(rid)
+
+    # ── 3. Customer history: past items ordered by this customer ──────────
     customer_history: Counter[str] = Counter()
-    if session.customer_id:
+    if cid:
         cust_orders_res = (
             db.table(cfg.orders_table)
             .select("items")
-            .eq("restaurant_id", str(session.restaurant_id))
-            .eq("customer_id", str(session.customer_id))
+            .eq("restaurant_id", str(rid))
+            .eq("customer_id", str(cid))
             .limit(20)
             .execute()
         )
@@ -90,14 +128,13 @@ def recommend_dishes(
                     if isinstance(it, dict) and "name" in it:
                         customer_history[str(it["name"]).lower()] += 1
 
-    # ── 4. Customer preferences (keyword matching) ────────────────────────────
+    # ── 4. Customer preferences (keyword matching) ─────────────────────────
     customer_prefs: list[str] = []
-    if session.customer_id:
-        cfg2 = get_settings()
+    if cid:
         pref_res = (
-            db.table(cfg2.customers_table)
+            db.table(cfg.customers_table)
             .select("preferences")
-            .eq("id", str(session.customer_id))
+            .eq("id", str(cid))
             .limit(1)
             .execute()
         )
@@ -109,7 +146,7 @@ def recommend_dishes(
             elif isinstance(raw_prefs, str):
                 customer_prefs = [p.strip().lower() for p in raw_prefs.strip("{}").split(",") if p.strip()]
 
-    # ── 5. Score and build results ────────────────────────────────────────────
+    # ── 5. Score and build results ─────────────────────────────────────────
     scored: list[tuple[float, RecommendedItem]] = []
     total_orders = sum(popularity.values()) or 1  # avoid div-by-zero
 

@@ -34,6 +34,10 @@ class Settings(BaseSettings):
         default="https://integrate.api.nvidia.com/v1/chat/completions"
     )
 
+    # ── NIM streaming (Phase 1) ─────────────────────────────────────────────
+    nim_stream: bool = Field(default=True, description="Enable true SSE streaming from NIM")
+    nim_max_tokens: int = Field(default=200, description="max_tokens sent to NIM")
+
     # ── Table names ─────────────────────────────────────────────────────────
     menu_table: str = Field(default="menu_items")
     orders_table: str = Field(default="orders")
@@ -47,6 +51,34 @@ class Settings(BaseSettings):
     session_ttl_hours: int = Field(default=6, ge=1)
     log_level: str = Field(default="INFO")
     port: int = Field(default=8000, ge=1, le=65535)
+
+    # ── Phase 0 timing ──────────────────────────────────────────────────────
+    debug_timing: bool = Field(
+        default=False,
+        description="If true, include a 'timing' object inside the done event data",
+    )
+
+    # ── Phase 2 concurrency ─────────────────────────────────────────────────
+    history_messages: int = Field(
+        default=20,
+        description="Number of past messages to load for context",
+    )
+    tool_timeout_s: float = Field(
+        default=5.0,
+        description="Per-tool execution timeout in seconds (TOOL_TIMEOUT_S)",
+    )
+
+    # ── Phase 3 cache TTLs (seconds) ────────────────────────────────────────
+    menu_cache_ttl: int = Field(default=45, description="Menu cache TTL in seconds")
+    session_cache_ttl: int = Field(default=30, description="Session cache TTL in seconds")
+    profile_cache_ttl: int = Field(default=120, description="Customer profile cache TTL in seconds")
+    popularity_cache_ttl: int = Field(default=300, description="Popularity scores cache TTL in seconds")
+
+    # ── Phase 5 prompt ──────────────────────────────────────────────────────
+    menu_in_prompt_max: int = Field(
+        default=60,
+        description="Max available menu items before switching to categories-only prompt",
+    )
 
     @field_validator("log_level")
     @classmethod

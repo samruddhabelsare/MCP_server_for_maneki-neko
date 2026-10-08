@@ -2,6 +2,9 @@
 
 Implements exact -> prefix -> contains matching (with ambiguity detection),
 search filtering (veg, spicy, category, max_price), and menu administration.
+
+Phase 3 adds TTL-based caching for menu items and categories.
+Cache is invalidated on every write (set_item_availability, update_item_price).
 """
 from __future__ import annotations
 
@@ -9,6 +12,7 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID
 
+from maneki.cache import menu_cache
 from maneki.config import get_settings
 from maneki.db import get_db
 from maneki.errors import AmbiguousItemError, ItemNotFoundError, ValidationError
@@ -16,16 +20,55 @@ from maneki.models import MenuItem
 
 
 def load_menu(restaurant_id: UUID | str, include_unavailable: bool = False) -> list[MenuItem]:
-    """Load all menu items for a restaurant."""
+    """Load all menu items for a restaurant (cached when include_unavailable=False)."""
+    rid = str(restaurant_id)
     cfg = get_settings()
-    db = get_db()
-    query = db.table(cfg.menu_table).select("*").eq("restaurant_id", str(restaurant_id))
-    if not include_unavailable:
-        query = query.eq("is_available", True)
 
-    res = query.execute()
+    # Only cache the available-items view (the hot path)
+    if not include_unavailable:
+        cache_key = f"menu:{rid}"
+        cached = menu_cache.get(cache_key)
+        if cached is not None:
+            return cast(list[MenuItem], cached)
+
+        db = get_db()
+        res = (
+            db.table(cfg.menu_table)
+            .select("*")
+            .eq("restaurant_id", rid)
+            .eq("is_available", True)
+            .execute()
+        )
+        rows = cast(list[dict[str, Any]], res.data) if res.data else []
+        items = [_parse_menu_item(r) for r in rows]
+        menu_cache.set(cache_key, items, ttl=cfg.menu_cache_ttl)
+        return items
+
+    # include_unavailable=True — bypass cache (admin path, rarely called)
+    db = get_db()
+    res = (
+        db.table(cfg.menu_table)
+        .select("*")
+        .eq("restaurant_id", rid)
+        .execute()
+    )
     rows = cast(list[dict[str, Any]], res.data) if res.data else []
     return [_parse_menu_item(r) for r in rows]
+
+
+def load_menu_categories(restaurant_id: UUID | str) -> list[str]:
+    """Return sorted distinct available category names (cached)."""
+    rid = str(restaurant_id)
+    cfg = get_settings()
+    cache_key = f"cats:{rid}"
+    cached = menu_cache.get(cache_key)
+    if cached is not None:
+        return cast(list[str], cached)
+
+    items = load_menu(rid, include_unavailable=False)
+    cats = sorted({item.category for item in items if item.category})
+    menu_cache.set(cache_key, cats, ttl=cfg.menu_cache_ttl)
+    return cats
 
 
 def search_menu(
@@ -69,6 +112,9 @@ def search_menu(
 def get_menu_item(restaurant_id: UUID | str, name: str) -> MenuItem:
     """Resolve a menu item by name using: exact -> prefix -> contains.
 
+    Always validates against LIVE menu (include_unavailable=True) so
+    add_item/set_quantity can detect truly unavailable items.
+
     Raises:
         ItemNotFoundError: If no candidate matches.
         AmbiguousItemError: If prefix or contains matching yields multiple candidates.
@@ -101,6 +147,16 @@ def get_menu_item(restaurant_id: UUID | str, name: str) -> MenuItem:
     raise ItemNotFoundError(name)
 
 
+def _invalidate_menu_cache(restaurant_id: UUID | str) -> None:
+    """Invalidate all menu/category cache entries for a restaurant."""
+    rid = str(restaurant_id)
+    menu_cache.invalidate(f"menu:{rid}")
+    menu_cache.invalidate(f"cats:{rid}")
+    # Also bust prompt cache for this restaurant (Phase 5)
+    from maneki.cache import prompt_cache  # local import to avoid circular
+    prompt_cache.invalidate_prefix(f"prompt:")  # noqa: F541 — clear all prompts on menu change
+
+
 def set_item_availability(
     restaurant_id: UUID | str,
     name: str,
@@ -118,6 +174,7 @@ def set_item_availability(
     )
     rows = cast(list[dict[str, Any]], res.data) if res.data else []
     raw = rows[0] if rows else {**item.model_dump(), "is_available": is_available}
+    _invalidate_menu_cache(restaurant_id)
     return _parse_menu_item(raw)
 
 
@@ -138,6 +195,7 @@ def update_item_price(
     )
     rows = cast(list[dict[str, Any]], res.data) if res.data else []
     raw = rows[0] if rows else {**item.model_dump(), "price": price}
+    _invalidate_menu_cache(restaurant_id)
     return _parse_menu_item(raw)
 
 
@@ -157,7 +215,9 @@ def set_item_availability_by_id(
     rows = cast(list[dict[str, Any]], res.data) if res.data else []
     if not rows:
         raise ItemNotFoundError(str(item_id))
-    return _parse_menu_item(rows[0])
+    result = _parse_menu_item(rows[0])
+    _invalidate_menu_cache(result.restaurant_id)
+    return result
 
 
 def update_item_price_by_id(
@@ -178,7 +238,9 @@ def update_item_price_by_id(
     rows = cast(list[dict[str, Any]], res.data) if res.data else []
     if not rows:
         raise ItemNotFoundError(str(item_id))
-    return _parse_menu_item(rows[0])
+    result = _parse_menu_item(rows[0])
+    _invalidate_menu_cache(result.restaurant_id)
+    return result
 
 
 def _parse_menu_item(raw: dict[str, Any]) -> MenuItem:

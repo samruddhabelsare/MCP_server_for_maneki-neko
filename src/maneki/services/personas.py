@@ -2,14 +2,21 @@
 
 Defines 5 character personalities and shared restaurant domain rules.
 Constructs the complete system prompt for the AI orchestrator.
+
+Phase 3: Static (restaurant+character) prefix is cached in prompt_cache.
+Phase 5:
+  - If restaurant has <= MENU_IN_PROMPT_MAX available items, include a compact
+    menu block in the system prompt.
+  - Pre-tool sentence rule added.
+  - Brevity rule added.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 from uuid import UUID
 
-from maneki.db import get_db
+from maneki.cache import prompt_cache
 from maneki.models import Customer
 
 
@@ -90,6 +97,8 @@ CRITICAL RESTAURANT RULES (MUST NEVER BE VIOLATED):
 1. NO INVENTED DISHES OR PRICES:
    - You do NOT know the full menu by heart. NEVER guess or invent dish names, ingredients, or prices.
    - ALWAYS use `search_menu` or `get_menu_item` to look up menu items and verify prices and availability.
+   - EXCEPTION: If a compact MENU SNAPSHOT is included in this prompt below, you MAY answer menu questions
+     directly from it WITHOUT calling a tool. The snapshot is current as of session start.
 
 2. QUANTITY ACCURACY:
    - Quantity ordered is EXACTLY what the customer specified.
@@ -116,6 +125,16 @@ CRITICAL RESTAURANT RULES (MUST NEVER BE VIOLATED):
 8. NO EMOJIS:
    - Do NOT use any unicode emojis or emoji icons in your responses (such as 🐱, 🍜, 🙏, 😊, ✨).
    - Use strictly plain text words, action asterisks (e.g. *bows*), and emotion bracket tags (e.g. [happy]). Never output emoji symbols under any circumstances.
+
+9. PRE-TOOL SENTENCE:
+   - Before calling ANY tool, first say ONE short sentence in the character's voice and the customer's language
+     (e.g. 'Ek second, check karta hoon...' or 'Let me check that for you right away!').
+   - This sentence is streamed immediately so the customer sees a response before the tool runs.
+
+10. BREVITY:
+    - Reply in at most 2 short sentences unless the customer explicitly asks for details.
+    - Never repeat the whole order back unless the customer asks for it.
+    - You may only state that an item was added AFTER the add_item tool has confirmed success.
 """.strip()
 
 
@@ -126,18 +145,10 @@ def get_persona(character: str | None) -> Persona:
 
 
 def get_menu_category_summary(restaurant_id: UUID | str) -> list[str]:
-    """Retrieve distinct available menu categories for a restaurant."""
-    db = get_db()
-    res = (
-        db.table("menu_items")
-        .select("category")
-        .eq("restaurant_id", str(restaurant_id))
-        .eq("is_available", True)
-        .execute()
-    )
-    rows = cast(list[dict[str, Any]], res.data) if res.data else []
-    cats = sorted({str(r["category"]) for r in rows if r.get("category")})
-    return cats
+    """Retrieve distinct available menu categories for a restaurant (uses menu cache)."""
+    from maneki.services.menu import load_menu_categories  # local import avoids circular
+
+    return load_menu_categories(restaurant_id)
 
 
 def build_system_prompt(
@@ -145,11 +156,71 @@ def build_system_prompt(
     customer_context: Customer | dict[str, Any] | None,
     menu_categories: list[str],
     table_number: int,
+    menu_items: list[Any] | None = None,  # list[MenuItem] when provided for Phase 5
 ) -> str:
-    """Construct the comprehensive system prompt for the orchestrator."""
+    """Construct the comprehensive system prompt for the orchestrator.
+
+    Phase 5: if menu_items is provided and len <= MENU_IN_PROMPT_MAX, include
+    a compact menu block. Customer-specific details are appended at the END so
+    the restaurant+character prefix can be prefix-cached by providers.
+    """
+    from maneki.config import get_settings  # local import to avoid circular at module level
+
+    cfg = get_settings()
     persona = get_persona(character)
 
-    # Customer profile formatting
+    # ── Static restaurant+character prefix (cache key excludes customer/table) ──
+    char_key = character or "default"
+    cats_key = ",".join(sorted(menu_categories))
+    items_count = len(menu_items) if menu_items is not None else -1
+    cache_key = f"prompt:{char_key}:{cats_key}:{items_count}"
+    cached_prefix = prompt_cache.get(cache_key)
+
+    if cached_prefix is not None:
+        static_prefix = cached_prefix
+    else:
+        categories_str = ", ".join(menu_categories) if menu_categories else "Varied Japanese & Asian Specialties"
+
+        # Build compact menu block (Phase 5)
+        menu_block = ""
+        if menu_items is not None and len(menu_items) <= cfg.menu_in_prompt_max and menu_items:
+            lines = ["MENU SNAPSHOT (available items only):"]
+            lines.append("Name | Price (₹) | Veg | Spicy | Category")
+            for mi in menu_items:
+                veg_tag = "V" if mi.is_veg else "NV"
+                spicy_tag = "S" if mi.is_spicy else "-"
+                lines.append(f"{mi.name} | {mi.price:.0f} | {veg_tag} | {spicy_tag} | {mi.category}")
+            menu_block = "\n".join(lines)
+
+        # ── Static prefix portion ────────────────────────────────────────────────
+        static_parts = [
+            f"YOU ARE: {persona.name}",
+            f"ROLE: {persona.description}",
+            f"TONE: {persona.tone}",
+            f"STYLE: {persona.style_guidance}",
+            "",
+            f"AVAILABLE MENU CATEGORIES:\n{categories_str}",
+        ]
+        if menu_block:
+            static_parts.append(f"\n{menu_block}")
+        if not menu_items or len(menu_items) > cfg.menu_in_prompt_max:
+            static_parts.append(
+                "(Note: Do not list out all menu items directly from memory; "
+                "invoke `search_menu` or `get_menu_item` to retrieve live items, prices, and availability.)"
+            )
+        else:
+            static_parts.append(
+                "(Note: Use the snapshot above to answer menu questions and recommend dishes "
+                "directly without calling a tool. To change the order you MUST still call "
+                "add_item/set_quantity/remove_item, and you may only say an item was added after the tool succeeded.)"
+            )
+        static_parts.append("")
+        static_parts.append(DOMAIN_RULES)
+
+        static_prefix = "\n".join(static_parts)
+        prompt_cache.set(cache_key, static_prefix, ttl=300)
+
+    # ── Customer/table section appended at the end ───────────────────────────
     if isinstance(customer_context, Customer):
         c_dict = customer_context.model_dump()
     elif isinstance(customer_context, dict):
@@ -182,20 +253,4 @@ def build_system_prompt(
             f"- Welcome them back warmly if visit_count > 1."
         )
 
-    categories_str = ", ".join(menu_categories) if menu_categories else "Varied Japanese & Asian Specialties"
-
-    prompt = f"""
-YOU ARE: {persona.name}
-ROLE: {persona.description}
-TONE: {persona.tone}
-STYLE: {persona.style_guidance}
-
-{customer_section}
-
-AVAILABLE MENU CATEGORIES:
-{categories_str}
-(Note: Do not list out all menu items directly from memory; invoke `search_menu` or `get_menu_item` to retrieve live items, prices, and availability.)
-
-{DOMAIN_RULES}
-""".strip()
-    return prompt
+    return f"{static_prefix}\n\n{customer_section}"

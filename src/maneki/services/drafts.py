@@ -3,6 +3,10 @@
 Handles adding, modifying quantities, removing, clearing, and fetching draft orders.
 Ensures single open draft per session, validates menu availability and canonical prices,
 and caps instructions to 200 characters.
+
+Phase 4: Mutating operations (add/set/remove/clear) call the draft_apply() Postgres
+RPC for atomic read-then-write in a single round trip.  get_current_draft remains
+a direct SELECT (no RPC needed).
 """
 from __future__ import annotations
 
@@ -60,9 +64,9 @@ def add_item(
     qty: int = 1,
     instructions: str = "",
 ) -> Draft:
-    """Add quantity of an item to the draft.
+    """Add quantity of an item to the draft (via draft_apply RPC).
 
-    Resolves item name canonicalized against the menu.
+    Resolves item name canonicalized against the menu (LIVE lookup).
     Rejects unavailable items.
     Accumulates quantity if the item already exists in the draft.
     """
@@ -73,35 +77,16 @@ def add_item(
     if not menu_item.is_available:
         raise ItemUnavailableError(menu_item.name)
 
-    draft = get_or_create_draft(session_id, restaurant_id)
     clean_instructions = instructions[:200].strip()
-
-    items = list(draft.items)
-    found = False
-    for i, it in enumerate(items):
-        if it.name.lower() == menu_item.name.lower():
-            # Update quantity and instructions
-            new_inst = clean_instructions or it.instructions
-            items[i] = DraftItem(
-                name=menu_item.name,
-                qty=it.qty + qty,
-                price=menu_item.price,
-                instructions=new_inst,
-            )
-            found = True
-            break
-
-    if not found:
-        items.append(
-            DraftItem(
-                name=menu_item.name,
-                qty=qty,
-                price=menu_item.price,
-                instructions=clean_instructions,
-            )
-        )
-
-    return _save_draft_items(draft.id, items, draft)
+    return _rpc_apply(
+        session_id=session_id,
+        restaurant_id=restaurant_id,
+        op="add",
+        name=menu_item.name,
+        qty=qty,
+        price=menu_item.price,
+        instructions=clean_instructions,
+    )
 
 
 def remove_item(
@@ -109,25 +94,21 @@ def remove_item(
     restaurant_id: UUID | str,
     name: str,
 ) -> Draft:
-    """Remove an item completely from the draft."""
-    draft = get_or_create_draft(session_id, restaurant_id)
-    target = name.strip().lower()
-
-    # Try resolving via menu item first for canonical name, or match directly in draft
-    canonical_name: str | None = None
+    """Remove an item completely from the draft (via draft_apply RPC)."""
+    # Attempt canonical name resolution; fall back to raw name if not found
+    canonical_name = name
     try:
         menu_item = get_menu_item(restaurant_id, name)
-        canonical_name = menu_item.name.lower()
+        canonical_name = menu_item.name
     except Exception:
         pass
 
-    items = [
-        it
-        for it in draft.items
-        if it.name.lower() != target and (canonical_name is None or it.name.lower() != canonical_name)
-    ]
-
-    return _save_draft_items(draft.id, items, draft)
+    return _rpc_apply(
+        session_id=session_id,
+        restaurant_id=restaurant_id,
+        op="remove",
+        name=canonical_name,
+    )
 
 
 def set_quantity(
@@ -136,9 +117,9 @@ def set_quantity(
     name: str,
     qty: int,
 ) -> Draft:
-    """Set absolute quantity of an item in the draft.
+    """Set absolute quantity of an item in the draft (via draft_apply RPC).
 
-    qty = 0 removes the item.
+    qty = 0 removes the item. Live menu lookup validates availability.
     """
     if qty < 0:
         raise ValidationError("Quantity cannot be negative.")
@@ -150,38 +131,23 @@ def set_quantity(
     if not menu_item.is_available:
         raise ItemUnavailableError(menu_item.name)
 
-    draft = get_or_create_draft(session_id, restaurant_id)
-    items = list(draft.items)
-    found = False
-
-    for i, it in enumerate(items):
-        if it.name.lower() == menu_item.name.lower():
-            items[i] = DraftItem(
-                name=menu_item.name,
-                qty=qty,
-                price=menu_item.price,
-                instructions=it.instructions,
-            )
-            found = True
-            break
-
-    if not found:
-        items.append(
-            DraftItem(
-                name=menu_item.name,
-                qty=qty,
-                price=menu_item.price,
-                instructions="",
-            )
-        )
-
-    return _save_draft_items(draft.id, items, draft)
+    return _rpc_apply(
+        session_id=session_id,
+        restaurant_id=restaurant_id,
+        op="set",
+        name=menu_item.name,
+        qty=qty,
+        price=menu_item.price,
+    )
 
 
 def clear_draft(session_id: UUID | str, restaurant_id: UUID | str) -> Draft:
-    """Empty all items from the draft."""
-    draft = get_or_create_draft(session_id, restaurant_id)
-    return _save_draft_items(draft.id, [], draft)
+    """Empty all items from the draft (via draft_apply RPC)."""
+    return _rpc_apply(
+        session_id=session_id,
+        restaurant_id=restaurant_id,
+        op="clear",
+    )
 
 
 def format_draft(draft: Draft) -> dict[str, Any]:
@@ -204,6 +170,105 @@ def format_draft(draft: Draft) -> dict[str, Any]:
         "total": round(sum(line["subtotal"] for line in lines), 2),
         "item_count": sum(line["qty"] for line in lines),
     }
+
+
+# ── Phase 4 RPC helper ────────────────────────────────────────────────────────
+
+def _rpc_apply(
+    session_id: UUID | str,
+    restaurant_id: UUID | str,
+    op: str,
+    name: str = "",
+    qty: int = 1,
+    price: float = 0.0,
+    instructions: str = "",
+) -> Draft:
+    """Call draft_apply() Postgres RPC and return the resulting Draft.
+
+    Falls back to Python-level read-then-write if the RPC returns no rows
+    (e.g. in test environments without the function installed).
+    """
+    db = get_db()
+    params: dict[str, Any] = {
+        "p_session_id": str(session_id),
+        "p_restaurant_id": str(restaurant_id),
+        "p_op": op,
+        "p_name": name,
+        "p_qty": qty,
+        "p_price": price,
+        "p_instructions": instructions,
+    }
+
+    try:
+        res = db.rpc("draft_apply", params).execute()
+        rows = cast(list[dict[str, Any]], res.data) if res.data else []
+        if rows:
+            return _parse_draft(rows[0])
+    except Exception:
+        pass
+
+    # Fallback: Python-level implementation (used in tests / pre-migration)
+    return _python_apply(
+        session_id=session_id,
+        restaurant_id=restaurant_id,
+        op=op,
+        name=name,
+        qty=qty,
+        price=price,
+        instructions=instructions,
+    )
+
+
+def _python_apply(
+    session_id: UUID | str,
+    restaurant_id: UUID | str,
+    op: str,
+    name: str = "",
+    qty: int = 1,
+    price: float = 0.0,
+    instructions: str = "",
+) -> Draft:
+    """Python-level fallback for draft_apply (used in tests)."""
+    draft = get_or_create_draft(session_id, restaurant_id)
+    items = list(draft.items)
+    name_lc = name.strip().lower()
+
+    if op == "clear":
+        items = []
+
+    elif op == "remove":
+        items = [it for it in items if it.name.lower() != name_lc]
+
+    elif op == "add":
+        found = False
+        for i, it in enumerate(items):
+            if it.name.lower() == name_lc:
+                new_inst = instructions or it.instructions
+                items[i] = DraftItem(
+                    name=name,
+                    qty=it.qty + qty,
+                    price=price,
+                    instructions=new_inst,
+                )
+                found = True
+                break
+        if not found:
+            items.append(DraftItem(name=name, qty=qty, price=price, instructions=instructions))
+
+    elif op == "set":
+        if qty == 0:
+            items = [it for it in items if it.name.lower() != name_lc]
+        else:
+            found = False
+            for i, it in enumerate(items):
+                if it.name.lower() == name_lc:
+                    items[i] = DraftItem(name=name, qty=qty, price=price, instructions=it.instructions)
+                    found = True
+                    break
+            if not found:
+                items.append(DraftItem(name=name, qty=qty, price=price, instructions=instructions))
+
+    return _save_draft_items(draft.id, items, draft)
 
 
 def _save_draft_items(draft_id: UUID, items: list[DraftItem], original_draft: Draft) -> Draft:

@@ -175,6 +175,77 @@ class FakeSupabase:
             draft["order_id"] = order_id
             return FakeQueryBuilder([order_row])
 
+        if name == "draft_apply" and params:
+            # Phase 4: Simulate the draft_apply Postgres function
+            sid = str(params["p_session_id"])
+            rid = str(params["p_restaurant_id"])
+            op = str(params.get("p_op", ""))
+            item_name = str(params.get("p_name") or "")
+            qty = int(params.get("p_qty") or 1)
+            price = float(params.get("p_price") or 0.0)
+            instructions = str(params.get("p_instructions") or "")
+            name_lc = item_name.lower()
+
+            # Find or create open draft
+            drafts = [
+                d for d in self._tables["order_drafts"]
+                if str(d.get("session_id")) == sid
+                and str(d.get("restaurant_id")) == rid
+                and d.get("status") == "open"
+            ]
+            if drafts:
+                draft = drafts[0]
+            else:
+                from datetime import UTC, datetime
+                from uuid import uuid4
+                draft = {
+                    "id": str(uuid4()),
+                    "session_id": sid,
+                    "restaurant_id": rid,
+                    "items": [],
+                    "status": "open",
+                    "order_id": None,
+                    "created_at": datetime.now(UTC).isoformat(),
+                    "updated_at": datetime.now(UTC).isoformat(),
+                }
+                self._tables["order_drafts"].append(draft)
+
+            items: list[dict[str, Any]] = list(draft.get("items") or [])
+
+            if op == "clear":
+                items = []
+
+            elif op == "remove":
+                items = [it for it in items if it.get("name", "").lower() != name_lc]
+
+            elif op == "add":
+                found = False
+                for i, it in enumerate(items):
+                    if it.get("name", "").lower() == name_lc:
+                        items[i] = {**it, "qty": it.get("qty", 0) + qty, "price": price}
+                        if instructions:
+                            items[i]["instructions"] = instructions
+                        found = True
+                        break
+                if not found:
+                    items.append({"name": item_name, "qty": qty, "price": price, "instructions": instructions})
+
+            elif op == "set":
+                if qty == 0:
+                    items = [it for it in items if it.get("name", "").lower() != name_lc]
+                else:
+                    found = False
+                    for i, it in enumerate(items):
+                        if it.get("name", "").lower() == name_lc:
+                            items[i] = {**it, "qty": qty, "price": price}
+                            found = True
+                            break
+                    if not found:
+                        items.append({"name": item_name, "qty": qty, "price": price, "instructions": instructions})
+
+            draft["items"] = items
+            return FakeQueryBuilder([draft])
+
         return FakeQueryBuilder([])
 
     def seed(self, table: str, rows: list[dict[str, Any]]) -> None:

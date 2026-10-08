@@ -284,7 +284,8 @@ async def recommend_dishes(
     try:
         session = require_session(ctx)
         results = svc_recommend_dishes(
-            session=session,
+            restaurant_id=session.restaurant_id,
+            customer_id=session.customer_id,
             veg_only=veg_only,
             exclude_spicy=exclude_spicy,
             limit=limit,

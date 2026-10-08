@@ -2,6 +2,9 @@
 
 Handles customer resolution, profile updates, phone normalization,
 and past-order preferences/favorites extraction.
+
+Phase 3: Customer profile context is cached in profile_cache.
+Cache is invalidated after confirm_order for that customer.
 """
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ from datetime import datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
 
+from maneki.cache import profile_cache
 from maneki.config import get_settings
 from maneki.db import get_db
 from maneki.models import Customer, SessionContext
@@ -87,7 +91,10 @@ def upsert_customer(
 
             db.table(cfg.customers_table).update(updates).eq("id", str(existing["id"])).execute()
             updated_data = {**existing, **updates}
-            return _parse_customer(updated_data)
+            customer = _parse_customer(updated_data)
+            # Invalidate profile cache on update
+            profile_cache.invalidate(f"profile:{customer.id}:{restaurant_id}")
+            return customer
 
     cid = uuid4()
     cust_name = name or "Customer"
@@ -111,6 +118,8 @@ def get_customer_context(session: SessionContext) -> dict[str, Any]:
 
     For guests: minimal information.
     For registered customers: name, preferences, visit_count, top-5 favorite dishes.
+
+    Phase 3: Result is cached in profile_cache.
     """
     if not session.customer_id:
         return {
@@ -120,6 +129,12 @@ def get_customer_context(session: SessionContext) -> dict[str, Any]:
             "visit_count": 1,
             "top_favorites": [],
         }
+
+    cache_key = f"profile:{session.customer_id}:{session.restaurant_id}"
+    cfg = get_settings()
+    cached = profile_cache.get(cache_key)
+    if cached is not None:
+        return cast(dict[str, Any], cached)
 
     customer = get_customer(session.customer_id)
     if not customer:
@@ -131,7 +146,6 @@ def get_customer_context(session: SessionContext) -> dict[str, Any]:
             "top_favorites": [],
         }
 
-    cfg = get_settings()
     db = get_db()
     orders_res = (
         db.table(cfg.orders_table)
@@ -154,13 +168,20 @@ def get_customer_context(session: SessionContext) -> dict[str, Any]:
 
     top_favorites = [name for name, _ in item_counts.most_common(5)]
 
-    return {
+    result: dict[str, Any] = {
         "guest": False,
         "name": customer.name,
         "preferences": customer.preferences,
         "visit_count": customer.visit_count,
         "top_favorites": top_favorites,
     }
+    profile_cache.set(cache_key, result, ttl=cfg.profile_cache_ttl)
+    return result
+
+
+def invalidate_customer_profile(customer_id: UUID | str, restaurant_id: UUID | str) -> None:
+    """Invalidate profile cache for a customer after confirm_order."""
+    profile_cache.invalidate(f"profile:{customer_id}:{restaurant_id}")
 
 
 def _parse_customer(raw: dict[str, Any]) -> Customer:
