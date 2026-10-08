@@ -766,6 +766,8 @@ async def stream_orchestrator_chat(
             "temperature": 0.2,
             "max_tokens": cfg.nim_max_tokens,
         }
+        if "nemotron" in cfg.nvidia_model.lower():
+            payload["chat_template_kwargs"] = {"thinking": False}
 
         # ── True SSE streaming from NIM (Phase 1) ────────────────────────────
         if cfg.nim_stream:
