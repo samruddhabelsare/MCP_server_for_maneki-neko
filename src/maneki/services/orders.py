@@ -236,17 +236,19 @@ def list_active_orders(restaurant_id: UUID | str) -> list[dict[str, Any]]:
     menu_items = load_menu(restaurant_id, include_unavailable=True)
     veg_map = {m.name.lower().strip(): m.is_veg for m in menu_items}
 
+    active_statuses = ["pending", "preparing", "ready"]
     res = (
         db.table(cfg.orders_table)
         .select("*")
         .eq("restaurant_id", str(restaurant_id))
+        .in_("status", active_statuses)
         .order("created_at", desc=False)
         .execute()
     )
     all_orders = cast(list[dict[str, Any]], res.data) if res.data else []
 
-    active_statuses = {"pending", "preparing", "ready"}
-    active = [o for o in all_orders if str(o.get("status", "")).lower() in active_statuses]
+    active_set = set(active_statuses)
+    active = [o for o in all_orders if str(o.get("status", "")).lower() in active_set]
 
     formatted: list[dict[str, Any]] = []
     for o in active:

@@ -24,6 +24,8 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from maneki.admin_api import router as admin_router
 from maneki.api import router as rest_router
@@ -32,6 +34,7 @@ from maneki.db import get_db
 from maneki.errors import ManekiError
 from maneki.mcp_admin import mcp_admin
 from maneki.mcp_customer import mcp_customer
+from maneki.rate_limit import limiter
 from maneki.services.menu import load_menu
 
 # ── Fail fast: validate config before anything else ─────────────────────────
@@ -129,6 +132,11 @@ app = FastAPI(
     redoc_url="/redoc",
     lifespan=lifespan,
 )
+
+# ── Rate limiting (slowapi) ───────────────────────────────────────────────────
+# Per-IP limits; the chat endpoint adds a tighter per-session limit via decorator.
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)  # type: ignore[arg-type]
 
 # ── CORS ─────────────────────────────────────────────────────────────────────
 app.add_middleware(

@@ -30,6 +30,7 @@ from maneki.orchestrator import (
 )
 from maneki.services.conversations import load_messages
 from maneki.services.drafts import get_current_draft
+from maneki.services.token import issue_token
 from maneki.services.personas import (
     DEFAULT_PERSONA,
     PERSONAS,
@@ -562,10 +563,11 @@ def test_rest_chat_endpoint_sse(test_data: dict[str, Any], monkeypatch: pytest.M
     monkeypatch.setenv("NVIDIA_API_KEY", "")
     get_settings.cache_clear()
 
+    token = issue_token(sid)
     resp = client.post(
         f"/sessions/{sid}/chat",
         json={"message": "Hello!"},
-        headers={"Authorization": f"Bearer {sid}"},
+        headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 200
     assert "text/event-stream" in resp.headers["content-type"]

@@ -7,6 +7,15 @@ Handles:
   - Order polling & payment: GET /orders/{id}/status, POST /orders/{id}/mark-billed
   - Feedback: POST /orders/{id}/feedback
   - Health check: GET /healthz
+
+Auth model
+----------
+POST /sessions returns a short-lived HMAC-signed ``session_token`` (see
+:mod:`maneki.services.token`).  All session-scoped endpoints require it as
+``Authorization: Bearer <token>``.  The raw session UUID is **no longer**
+accepted as a bearer token.
+
+POST /orders/{id}/mark-billed additionally requires ``X-Admin-Key``.
 """
 from __future__ import annotations
 
@@ -14,14 +23,17 @@ import time
 from typing import Any
 from uuid import UUID
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
+from maneki.admin_api import verify_admin
+from maneki.config import get_settings
 from maneki.db import get_db
 from maneki.errors import UnauthorizedError, ValidationError
-from maneki.models import ok
+from maneki.models import Session, ok
 from maneki.orchestrator import stream_orchestrator_chat
+from maneki.rate_limit import get_chat_rate_limit_key, limiter
 from maneki.services.conversations import load_messages
 from maneki.services.customers import upsert_customer
 from maneki.services.drafts import (
@@ -38,6 +50,7 @@ from maneki.services.orders import (
     mark_billed,
 )
 from maneki.services.sessions import create_session, get_session
+from maneki.services.token import issue_token, verify_token
 
 router = APIRouter()
 
@@ -142,6 +155,13 @@ async def create_session_endpoint(payload: CreateSessionRequest) -> dict[str, An
         character=payload.character,
     )
 
+    # Issue a short-lived HMAC-signed token so clients never send the raw UUID.
+    token = issue_token(
+        session.id,
+        session_expires_at=session.expires_at,
+        ttl_hours=get_settings().session_ttl_hours,
+    )
+
     return ok(
         session_id=str(session.id),
         restaurant_id=str(session.restaurant_id),
@@ -149,6 +169,7 @@ async def create_session_endpoint(payload: CreateSessionRequest) -> dict[str, An
         customer=customer_data,
         character=session.character,
         expires_at=session.expires_at.isoformat(),
+        session_token=token,
     )
 
 
@@ -250,13 +271,16 @@ async def get_session_messages_endpoint(
 
 
 @router.post("/sessions/{id}/chat", tags=["chat"])
+@limiter.limit("30/minute", key_func=get_chat_rate_limit_key)
 async def session_chat_endpoint(
+    request: Request,  # required by slowapi rate limiter
     id: UUID,
     payload: ChatRequest,
     authorization: str | None = Header(default=None),
 ) -> StreamingResponse:
     """Stream chat interaction with the AI waiter via Server-Sent Events (SSE).
 
+    Rate-limited to 30 messages/minute per IP (protects NIM token cost).
     Runs the server-side tool-calling loop (NVIDIA NIM) bound to the session.
     Emits token events, draft events on cart changes, and done event upon completion.
     """
@@ -289,9 +313,12 @@ async def get_order_status_endpoint(id: UUID) -> dict[str, Any]:
     return ok(**status_data)
 
 
-@router.post("/orders/{id}/mark-billed", tags=["orders"])
+@router.post("/orders/{id}/mark-billed", tags=["orders"], dependencies=[Depends(verify_admin)])
 async def mark_billed_endpoint(id: UUID, payload: MarkBilledRequest) -> dict[str, Any]:
-    """Record payment method and mark order as billed."""
+    """Record payment method and mark order as billed.
+
+    Requires ``X-Admin-Key`` header.
+    """
     order = mark_billed(order_id=id, payment_method=payload.payment_method)
     return ok(order=order.model_dump())
 
@@ -306,13 +333,27 @@ async def submit_feedback_endpoint(id: UUID, payload: SubmitFeedbackRequest) -> 
     return ok(feedback=fb.model_dump())
 
 
-# ── Helper ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _verify_session_access(session_id: UUID, authorization: str | None) -> Any:
-    """Validate that the session exists, is unexpired, and token matches if provided."""
-    session = get_session(session_id)
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization[7:].strip()
-        if token != str(session_id):
-            raise UnauthorizedError("Session authorization header does not match requested session ID")
-    return session
+
+def _verify_session_access(session_id: UUID, authorization: str | None) -> Session:
+    """Require a valid HMAC-signed session token and return the active session.
+
+    The ``Authorization: Bearer <token>`` header is **mandatory**.  The token
+    must have been issued by :func:`~maneki.services.token.issue_token` for
+    this exact session UUID.
+
+    Raises:
+        UnauthorizedError: Header is missing, token is invalid/expired, or the
+            embedded session ID does not match the URL parameter.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        raise UnauthorizedError("Authorization header is required")
+
+    raw_token = authorization[7:].strip()
+    token_session_id = verify_token(raw_token)  # raises UnauthorizedError if bad
+
+    if token_session_id != session_id:
+        raise UnauthorizedError("Token session ID does not match the requested session")
+
+    return get_session(session_id)

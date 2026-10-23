@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     # ── Auth tokens ─────────────────────────────────────────────────────────
     admin_api_key: str = Field(..., description="Protects /mcp/admin and admin REST routes")
     internal_mcp_token: str = Field(..., description="Orchestrator → /mcp/customer auth")
+    session_token_secret: str = Field(
+        default="",
+        description="Dedicated secret for signing session tokens; falls back to admin_api_key if unset",
+    )
 
     # ── NVIDIA (Phase 3) ────────────────────────────────────────────────────
     nvidia_api_key: str = Field(default="", description="Leave empty until M6")

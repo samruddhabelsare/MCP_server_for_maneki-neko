@@ -8,6 +8,8 @@ Phases implemented:
            concurrent tool execution with per-session Lock; draft events after each mutation.
   Phase 3: Warm menu + categories from cache; profile from cache; compact menu in prompt.
   Phase 5: build_system_prompt receives menu_items for compact snapshot.
+  Security: HMAC session tokens; asyncio.create_task fire-and-forget for DB writes.
+  Resilience: pybreaker circuit breaker around NIM; per-IP slowapi rate limit on chat.
 
 SSE contract (unchanged):
   event: token  {"token": "..."}
@@ -28,6 +30,7 @@ from uuid import UUID
 
 import httpx
 
+from maneki.circuit_breaker import AsyncCircuitBreaker, CircuitBreakerError
 from maneki.config import get_settings
 from maneki.errors import ManekiError
 from maneki.models import SessionContext
@@ -67,6 +70,38 @@ logger = logging.getLogger("maneki.orchestrator")
 timing_logger = logging.getLogger("maneki.timing")
 
 MAX_TOOL_ITERATIONS = 5
+
+# ── NIM circuit breaker ─────────────────────────────────────────────────────────────────
+# Async-native circuit breaker for streaming calls.
+# Trips after 5 consecutive NIM failures; stays open for 60 s.
+# When open, requests fail immediately instead of waiting the full 60 s timeout.
+_nim_breaker = AsyncCircuitBreaker(
+    fail_max=5,
+    reset_timeout=60.0,
+    name="nim",
+)
+
+# Strong references to in-flight background tasks to prevent garbage collection mid-flight.
+_background_tasks: set[asyncio.Task[Any]] = set()
+
+# Pending message writes per session.
+# If a fast follow-up turn arrives, it awaits any pending write from the prior turn
+# before loading past messages, ensuring complete history.
+_pending_session_writes: dict[UUID, asyncio.Task[Any]] = {}
+
+
+def _track_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
+    _background_tasks.add(task)
+
+    def _done_cb(t: asyncio.Task[Any]) -> None:
+        _background_tasks.discard(t)
+        if not t.cancelled():
+            exc = t.exception()
+            if exc:
+                logger.error("Background task failed: %r", exc, exc_info=exc)
+
+    task.add_done_callback(_done_cb)
+    return task
 
 # Per-session asyncio.Lock registry (Phase 2).
 # Mutations on the same session draft are serialized; dict is cleaned lazily.
@@ -642,17 +677,25 @@ async def stream_orchestrator_chat(
     timing: dict[str, Any] = {}
     tool_timings: list[dict[str, Any]] = []
 
-    # ── 1. Persist incoming user message (non-blocking) ──────────────────────
-    try:
-        await asyncio.to_thread(
-            save_message,
-            session_id=sid,
-            restaurant_id=rid,
-            role="user",
-            content=user_message,
+    # ── 0. Await any pending message write from the prior turn for this session ──
+    pending_prior = _pending_session_writes.get(sid)
+    if pending_prior and not pending_prior.done():
+        with contextlib.suppress(Exception):
+            await pending_prior
+
+    # ── 1. Persist incoming user message (concurrent with setup) ─────────────
+    user_save_task = _track_task(
+        asyncio.create_task(
+            asyncio.to_thread(
+                save_message,
+                session_id=sid,
+                restaurant_id=rid,
+                role="user",
+                content=user_message,
+            )
         )
-    except Exception as exc:
-        logger.warning("Failed to save incoming user message: %s", exc)
+    )
+    _pending_session_writes[sid] = user_save_task
 
     # ── 2. Check NVIDIA API key ──────────────────────────────────────────────
     if not cfg.nvidia_api_key:
@@ -661,6 +704,23 @@ async def stream_orchestrator_chat(
             "error": "nvidia_key_missing",
             "message": "NVIDIA_API_KEY is not configured on the server.",
         })
+        with contextlib.suppress(Exception):
+            await user_save_task
+        return
+
+    # Check circuit breaker before proceeding with setup or inference
+    if _nim_breaker.is_open():
+        logger.error("NIM circuit breaker is OPEN — fast failing request")
+        yield _format_sse("error", {
+            "ok": False,
+            "error": "llm_unavailable",
+            "message": (
+                "The AI assistant is temporarily unavailable. "
+                "Your cart is safe — please use the order panel to review and confirm."
+            ),
+        })
+        with contextlib.suppress(Exception):
+            await user_save_task
         return
 
     # ── 3. Concurrent setup: profile + menu + history ────────────────────────
@@ -778,6 +838,9 @@ async def stream_orchestrator_chat(
 
             for attempt in range(2):
                 try:
+                    # Check if circuit is open before beginning stream
+                    _nim_breaker.check_gate()
+
                     async for text_delta, tool_calls in _stream_nim(
                         client=http_client,
                         payload=payload,
@@ -790,24 +853,38 @@ async def stream_orchestrator_chat(
                             timing["nim_first_byte_ms"] = nim_first_byte_ms
 
                         if tool_calls is not None:
-                            # End of stream — got final tool_calls list
                             tool_calls_in_this_round = tool_calls
                             break
 
                         if text_delta:
-                            # Forward text immediately to browser (Phase 1)
                             if ttft_ms is None:
                                 ttft_ms = round((time.monotonic() - t_start) * 1000, 1)
                                 timing["ttft_ms"] = ttft_ms
                             yield _format_sse("token", {"token": text_delta})
                             text_in_this_round += text_delta
 
-                    # Success — break retry loop
+                    # Success — close/reset circuit breaker on clean stream completion
+                    _nim_breaker.record_success()
                     break
 
+                except CircuitBreakerError:
+                    # Circuit breaker is OPEN — fast fail without upstream call
+                    logger.error("NIM circuit breaker is OPEN — skipping request")
+                    yield _format_sse("error", {
+                        "ok": False,
+                        "error": "llm_unavailable",
+                        "message": (
+                            "The AI assistant is temporarily unavailable. "
+                            "Your cart is safe — please use the order panel to review and confirm."
+                        ),
+                    })
+                    with contextlib.suppress(Exception):
+                        await user_save_task
+                    return
+
                 except (httpx.TimeoutException, httpx.NetworkError) as exc:
+                    _nim_breaker.record_failure(exc)
                     if first_byte_received:
-                        # Mid-stream failure: emit error and persist what we have
                         logger.error("NIM stream broke mid-response: %r", exc)
                         yield _format_sse("error", {
                             "ok": False,
@@ -839,7 +916,25 @@ async def stream_orchestrator_chat(
                     })
                     return
 
+                except httpx.HTTPStatusError as exc:
+                    # 5xx server errors count against breaker; 4xx client errors do not
+                    if exc.response.status_code >= 500:
+                        _nim_breaker.record_failure(exc)
+                    logger.error("NIM API HTTP status error: %r", exc, exc_info=True)
+                    yield _format_sse("error", {
+                        "ok": False,
+                        "error": "llm_error",
+                        "message": f"AI service returned HTTP error: {exc}",
+                    })
+                    return
+
+                except asyncio.CancelledError:
+                    # Client disconnected mid-stream; do not penalize circuit breaker
+                    logger.info("Client disconnected from chat stream")
+                    raise
+
                 except Exception as exc:
+                    _nim_breaker.record_failure(exc)
                     if first_byte_received:
                         logger.error("NIM stream error mid-response: %r", exc, exc_info=True)
                         yield _format_sse("error", {
@@ -855,6 +950,7 @@ async def stream_orchestrator_chat(
                         "message": f"AI service error: {exc}",
                     })
                     return
+
 
             # Case A: tool calls requested this round
             if tool_calls_in_this_round:
@@ -1076,19 +1172,7 @@ async def stream_orchestrator_chat(
             yield _format_sse("token", {"token": token_piece})
             await asyncio.sleep(0.01)
 
-    # ── 9. Persist assistant final message ───────────────────────────────────
-    try:
-        await asyncio.to_thread(
-            save_message,
-            session_id=sid,
-            restaurant_id=rid,
-            role="assistant",
-            content=final_text_accumulated,
-        )
-    except Exception as exc:
-        logger.warning("Failed to save assistant message: %s", exc)
-
-    # ── 10. Emit done event (Phase 0 timing) ──────────────────────────────────
+    # ── 9. Collect timing and emit done event ────────────────────────────────
     total_ms = round((time.monotonic() - t_start) * 1000, 1)
     timing["total_ms"] = total_ms
     timing["nim_rounds"] = nim_rounds
@@ -1114,7 +1198,31 @@ async def stream_orchestrator_chat(
     if cfg.debug_timing:
         done_data["timing"] = timing
 
+    # Emit done FIRST — browser can render the complete message immediately.
     yield _format_sse("done", done_data)
+
+    # ── 10. Persist messages (after done event) ──────────────────────────────
+    # The done event was already emitted above, so the client receives the
+    # response immediately with zero delay. Awaiting here ensures DB persistence
+    # before closing the generator connection, while registering with
+    # _pending_session_writes guarantees rapid follow-up requests won't miss it.
+    with contextlib.suppress(Exception):
+        await user_save_task
+
+    assistant_save_task = _track_task(
+        asyncio.create_task(
+            asyncio.to_thread(
+                save_message,
+                session_id=sid,
+                restaurant_id=rid,
+                role="assistant",
+                content=final_text_accumulated,
+            )
+        )
+    )
+    _pending_session_writes[sid] = assistant_save_task
+    await assistant_save_task
+
 
 
 def _format_sse(event: str, data: dict[str, Any]) -> str:
